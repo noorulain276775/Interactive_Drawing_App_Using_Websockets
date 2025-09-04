@@ -145,6 +145,13 @@ export const redrawCanvas = (
   
   // Redraw all actions
   actions.forEach(action => {
-    drawShape(ctx, action.type, action.points, action.color, action.brushSize)
+    if (action.type === 'eraser' || action.color === 'eraser') {
+      // For eraser, use destination-out composite operation
+      ctx.globalCompositeOperation = 'destination-out'
+      drawShape(ctx, action.type, action.points, 'white', action.brushSize)
+      ctx.globalCompositeOperation = 'source-over' // Reset composite operation
+    } else {
+      drawShape(ctx, action.type, action.points, action.color, action.brushSize)
+    }
   })
 }

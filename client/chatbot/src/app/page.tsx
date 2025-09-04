@@ -6,10 +6,38 @@ import { useSocket } from '../../hooks/useSocket'
 import { useDrawingTools } from '../../hooks/useDrawingTools'
 import { useRoom } from '../../hooks/useRoom'
 import { useDrawingPersistence } from '../../hooks/useDrawingPersistence'
-import { ChromePicker } from 'react-color'
 import { drawShape, redrawCanvas } from '../../utils/drawingUtils'
+import dynamic from 'next/dynamic'
+
+// Dynamically import ChromePicker to prevent SSR issues
+const ChromePicker = dynamic(() => import('react-color').then(mod => ({ default: mod.ChromePicker })), {
+  ssr: false,
+  loading: () => <div className="w-225 h-150 bg-gray-200 rounded animate-pulse"></div>
+})
 
 interface pageProps {}
+
+// Client-only wrapper component to prevent hydration issues
+const ClientOnlyWrapper: FC<{ children: React.ReactNode }> = ({ children }) => {
+  const [hasMounted, setHasMounted] = useState(false)
+
+  useEffect(() => {
+    setHasMounted(true)
+  }, [])
+
+  if (!hasMounted) {
+    return (
+      <div className='w-screen h-screen bg-white flex justify-center items-center'>
+        <div className='text-center'>
+          <div className='animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto mb-4'></div>
+          <p className='text-gray-600'>Loading drawing app...</p>
+        </div>
+      </div>
+    )
+  }
+
+  return <>{children}</>
+}
 
 const page: FC<pageProps> = ({}) => {
   const [color, setColor] = useState<string>('#000')
@@ -66,19 +94,26 @@ const page: FC<pageProps> = ({}) => {
   
   const { canvasRef, onMouseDown, clear } = useDraw(drawLine)
 
-  // State to handle client-side rendering
-  const [isClient, setIsClient] = useState(false)
+  // State for drawing functionality
   const [activeDrawer, setActiveDrawer] = useState<string | null>(null)
   const [currentPath, setCurrentPath] = useState<Point[]>([])
   const [newRoomName, setNewRoomName] = useState('')
+  const [newRoomPassword, setNewRoomPassword] = useState('')
+  const [joinRoomPassword, setJoinRoomPassword] = useState('')
+  const [selectedRoomToJoin, setSelectedRoomToJoin] = useState<string | null>(null)
   const [roomCanvasHistory, setRoomCanvasHistory] = useState<Map<string, DrawAction[]>>(new Map())
   const [saveDrawingName, setSaveDrawingName] = useState('')
   const [fileInputRef, setFileInputRef] = useState<HTMLInputElement | null>(null)
+  const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  const [canUndoState, setCanUndoState] = useState(false)
+  const [canRedoState, setCanRedoState] = useState(false)
 
-  // Check if the component is being rendered on the client side
+
+  // Update undo/redo state whenever history changes
   useEffect(() => {
-    setIsClient(true)
-  }, [])
+    setCanUndoState(canUndo())
+    setCanRedoState(canRedo())
+  }, [canUndo, canRedo])
 
   // Connect room hook with socket events
   useEffect(() => {
@@ -89,6 +124,9 @@ const page: FC<pageProps> = ({}) => {
       ;(window as any).updateSavedDrawings = updateSavedDrawings
       ;(window as any).handleDrawingLoaded = handleDrawingLoaded
       ;(window as any).handleDrawingDeleted = handleDrawingDeleted
+      ;(window as any).updateErrorMessage = setErrorMessage
+      ;(window as any).handleUndoFromOther = handleUndoFromOther
+      ;(window as any).handleRedoFromOther = handleRedoFromOther
     }
     
     return () => {
@@ -98,6 +136,9 @@ const page: FC<pageProps> = ({}) => {
       delete (window as any).updateSavedDrawings
       delete (window as any).handleDrawingLoaded
       delete (window as any).handleDrawingDeleted
+      delete (window as any).updateErrorMessage
+      delete (window as any).handleUndoFromOther
+      delete (window as any).handleRedoFromOther
     }
   }, [socket, updateCurrentRoom, updateRoomList, updateSavedDrawings])
 
@@ -166,6 +207,8 @@ const page: FC<pageProps> = ({}) => {
     // Draw the shape
     drawShape(ctx, selectedTool, points, color, brushSize)
 
+    // Don't add to history here - we'll add the complete path on mouse up
+
     // Emit drawing data to other clients
     if (socket && isConnected && currentUser && currentRoom) {
       socket.emit('draw-line', {
@@ -181,7 +224,7 @@ const page: FC<pageProps> = ({}) => {
     }
   }
 
-  // Handle mouse down for shape tools
+  // Handle mouse down for all tools
   const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!canvasRef.current) return
 
@@ -195,14 +238,45 @@ const page: FC<pageProps> = ({}) => {
     setStartPoint(point)
     setCurrentPath([point])
 
-    // For shape tools, we need to handle them differently
-    if (selectedTool !== 'brush' && selectedTool !== 'eraser') {
-      // Shape tools will be completed on mouse up
+    // For brush and eraser, start drawing immediately
+    if (selectedTool === 'brush' || selectedTool === 'eraser') {
+      onMouseDown()
+    }
+    // For shape tools, we'll handle them on mouse up
+  }
+
+  // Handle mouse move for shape preview
+  const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!isDrawing || !startPoint || !canvasRef.current) return
+
+    const rect = canvasRef.current.getBoundingClientRect()
+    const currentPoint = {
+      x: e.clientX - rect.left,
+      y: e.clientY - rect.top
+    }
+
+    // For brush and eraser, use the existing drawing logic
+    if (selectedTool === 'brush' || selectedTool === 'eraser') {
+      // The existing onMouseMove from useDraw hook handles this
       return
     }
 
-    // For brush and eraser, start drawing immediately
-    onMouseDown()
+    // For shape tools, update the current path and redraw
+    if (selectedTool === 'rectangle' || selectedTool === 'circle' || selectedTool === 'line') {
+      setCurrentPath([startPoint, currentPoint])
+      
+      // Redraw the canvas with the preview
+      if (canvasRef.current) {
+        const ctx = canvasRef.current.getContext('2d')
+        if (ctx) {
+          // Clear and redraw everything
+          redrawCanvas(ctx, getCurrentHistory())
+          
+          // Draw the preview shape
+          drawShape(ctx, selectedTool, [startPoint, currentPoint], color, brushSize)
+        }
+      }
+    }
   }
 
   // Handle mouse up for shape completion
@@ -211,12 +285,37 @@ const page: FC<pageProps> = ({}) => {
 
     setIsDrawing(false)
     
+    // For shape tools, we need to draw the shape now
+    if (selectedTool === 'rectangle' || selectedTool === 'circle' || selectedTool === 'line') {
+      if (canvasRef.current) {
+        const ctx = canvasRef.current.getContext('2d')
+        if (ctx && currentPath.length >= 2) {
+          // Draw the shape
+          drawShape(ctx, selectedTool, currentPath, color, brushSize)
+          
+          // Emit to other clients
+          if (socket && isConnected && currentRoom) {
+            socket.emit('draw-line', {
+              currentPoint: currentPath[currentPath.length - 1],
+              prevPoint: currentPath[0],
+              color,
+              brushSize,
+              tool: selectedTool,
+              userId: currentUser.id,
+              userName: currentUser.name,
+              roomId: currentRoom.id
+            })
+          }
+        }
+      }
+    }
+    
     // Complete the drawing action
     if (currentPath.length > 0) {
       const action: DrawAction = {
         type: selectedTool,
         points: currentPath,
-        color,
+        color: selectedTool === 'eraser' ? 'eraser' : color, // Special marker for eraser
         brushSize,
         userId: currentUser.id,
         userName: currentUser.name,
@@ -224,6 +323,9 @@ const page: FC<pageProps> = ({}) => {
       }
       
       addToHistory(action)
+      // Update undo/redo state
+      setCanUndoState(canUndo())
+      setCanRedoState(canRedo())
     }
 
     setStartPoint(null)
@@ -237,6 +339,14 @@ const page: FC<pageProps> = ({}) => {
       if (ctx) {
         redrawCanvas(ctx, getCurrentHistory())
       }
+      // Update undo/redo state
+      setCanUndoState(canUndo())
+      setCanRedoState(canRedo())
+      
+      // Emit undo action to other users in the room
+      if (socket && isConnected && currentRoom) {
+        socket.emit('undo-action', { roomId: currentRoom.id })
+      }
     }
   }
 
@@ -247,6 +357,14 @@ const page: FC<pageProps> = ({}) => {
       if (ctx) {
         redrawCanvas(ctx, getCurrentHistory())
       }
+      // Update undo/redo state
+      setCanUndoState(canUndo())
+      setCanRedoState(canRedo())
+      
+      // Emit redo action to other users in the room
+      if (socket && isConnected && currentRoom) {
+        socket.emit('redo-action', { roomId: currentRoom.id })
+      }
     }
   }
 
@@ -255,24 +373,84 @@ const page: FC<pageProps> = ({}) => {
     clear()
     clearHistory()
     
+    // Update undo/redo state
+    setCanUndoState(canUndo())
+    setCanRedoState(canRedo())
+    
     // Broadcast clear event to other clients
     if (socket && isConnected && currentRoom) {
       socket.emit('clear-canvas', { roomId: currentRoom.id })
     }
   }
 
+  // Handle undo from other users
+  const handleUndoFromOther = () => {
+    if (undo() && canvasRef.current) {
+      const ctx = canvasRef.current.getContext('2d')
+      if (ctx) {
+        redrawCanvas(ctx, getCurrentHistory())
+      }
+      // Update undo/redo state
+      setCanUndoState(canUndo())
+      setCanRedoState(canRedo())
+    }
+  }
+
+  // Handle redo from other users
+  const handleRedoFromOther = () => {
+    if (redo() && canvasRef.current) {
+      const ctx = canvasRef.current.getContext('2d')
+      if (ctx) {
+        redrawCanvas(ctx, getCurrentHistory())
+      }
+      // Update undo/redo state
+      setCanUndoState(canUndo())
+      setCanRedoState(canRedo())
+    }
+  }
+
   // Room management handlers
   const handleCreateRoom = () => {
     if (newRoomName.trim() && socket && currentUser) {
-      socket.emit('create-room', { roomName: newRoomName.trim(), isPrivate: false })
+      // Validate password if provided
+      if (newRoomPassword && (newRoomPassword.length !== 6 || !/^\d{6}$/.test(newRoomPassword))) {
+        setErrorMessage('Password must be exactly 6 digits')
+        setTimeout(() => setErrorMessage(null), 5000)
+        return
+      }
+
+      socket.emit('create-room', { 
+        roomName: newRoomName.trim(), 
+        isPrivate: false, 
+        password: newRoomPassword || undefined 
+      })
       setNewRoomName('')
+      setNewRoomPassword('')
       toggleCreateRoom()
     }
   }
 
   const handleJoinRoom = (roomId: string) => {
     if (socket) {
+      // Check if room requires password
+      const room = availableRooms.find(r => r.id === roomId)
+      if (room && room.password) {
+        setSelectedRoomToJoin(roomId)
+        setJoinRoomPassword('')
+        return
+      }
+      
+      // Join room without password
       socket.emit('join-room', { roomId })
+      toggleRoomList()
+    }
+  }
+
+  const handleJoinRoomWithPassword = () => {
+    if (socket && selectedRoomToJoin) {
+      socket.emit('join-room', { roomId: selectedRoomToJoin, password: joinRoomPassword })
+      setSelectedRoomToJoin(null)
+      setJoinRoomPassword('')
       toggleRoomList()
     }
   }
@@ -392,8 +570,31 @@ const page: FC<pageProps> = ({}) => {
   }
 
   return (
-    <div className='w-screen h-screen bg-white flex justify-center items-center'>
-      <div className='flex flex-col gap-10 pr-10'>
+    <ClientOnlyWrapper>
+      <div className='w-screen h-screen bg-white flex flex-col lg:flex-row'>
+        {/* Mobile Header */}
+        <div className='lg:hidden p-4 bg-gray-50 border-b'>
+          <div className='flex items-center justify-between'>
+            <h1 className='text-lg font-semibold text-gray-800'>Drawing App</h1>
+            <div className={`px-2 py-1 rounded text-xs font-medium ${
+              isConnected 
+                ? 'bg-green-100 text-green-800' 
+                : 'bg-red-100 text-red-800'
+            }`}>
+              {isConnected ? '🟢 Connected' : '🔴 Disconnected'}
+            </div>
+          </div>
+          
+          {/* Error Message */}
+          {errorMessage && (
+            <div className='mt-2 p-2 bg-red-100 border border-red-300 text-red-700 text-sm rounded'>
+              {errorMessage}
+            </div>
+          )}
+        </div>
+
+        {/* Sidebar - Hidden on mobile, shown on desktop */}
+        <div className='hidden lg:flex lg:flex-col lg:w-80 lg:h-screen lg:overflow-y-auto lg:bg-gray-50 lg:border-r lg:p-4 lg:gap-4'>
         {/* Connection Status */}
         <div className={`p-2 rounded-md text-sm font-medium ${
           isConnected 
@@ -402,6 +603,13 @@ const page: FC<pageProps> = ({}) => {
         }`}>
           {isConnected ? '🟢 Connected' : '🔴 Disconnected'}
         </div>
+
+        {/* Error Message */}
+        {errorMessage && (
+          <div className='p-2 bg-red-100 border border-red-300 text-red-700 text-sm rounded'>
+            {errorMessage}
+          </div>
+        )}
 
         {/* Room Management */}
         <div className='p-3 rounded-md bg-purple-50 border border-purple-200'>
@@ -448,29 +656,39 @@ const page: FC<pageProps> = ({}) => {
               </div>
               
               {isCreatingRoom && (
-                <div className='flex gap-2'>
+                <div className='space-y-2'>
                   <input
                     type='text'
                     placeholder='Room name'
                     value={newRoomName}
                     onChange={(e) => setNewRoomName(e.target.value)}
-                    className='flex-1 px-2 py-1 text-sm border border-purple-300 rounded'
+                    className='w-full px-2 py-1 text-sm border border-purple-300 rounded'
                     onKeyPress={(e) => e.key === 'Enter' && handleCreateRoom()}
                   />
-                  <button
-                    type='button'
-                    className='px-2 py-1 text-sm bg-green-100 text-green-700 rounded hover:bg-green-200'
-                    onClick={handleCreateRoom}
-                  >
-                    Create
-                  </button>
-                  <button
-                    type='button'
-                    className='px-2 py-1 text-sm bg-gray-100 text-gray-700 rounded hover:bg-gray-200'
-                    onClick={toggleCreateRoom}
-                  >
-                    Cancel
-                  </button>
+                  <input
+                    type='text'
+                    placeholder='Password (6 digits, optional)'
+                    value={newRoomPassword}
+                    onChange={(e) => setNewRoomPassword(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                    className='w-full px-2 py-1 text-sm border border-purple-300 rounded'
+                    maxLength={6}
+                  />
+                  <div className='flex gap-2'>
+                    <button
+                      type='button'
+                      className='px-2 py-1 text-sm bg-green-100 text-green-700 rounded hover:bg-green-200'
+                      onClick={handleCreateRoom}
+                    >
+                      Create
+                    </button>
+                    <button
+                      type='button'
+                      className='px-2 py-1 text-sm bg-gray-100 text-gray-700 rounded hover:bg-gray-200'
+                      onClick={toggleCreateRoom}
+                    >
+                      Cancel
+                    </button>
+                  </div>
                 </div>
               )}
               
@@ -480,7 +698,10 @@ const page: FC<pageProps> = ({}) => {
                     availableRooms.map((room) => (
                       <div key={room.id} className='flex items-center justify-between p-2 bg-white rounded border'>
                         <div className='text-sm'>
-                          <div className='font-medium'>{room.name}</div>
+                          <div className='font-medium flex items-center gap-1'>
+                            {room.name}
+                            {room.password && <span className='text-xs text-orange-600'>🔒</span>}
+                          </div>
                           <div className='text-xs text-gray-500'>
                             {room.userCount} users | by {room.createdBy}
                           </div>
@@ -497,6 +718,47 @@ const page: FC<pageProps> = ({}) => {
                   ) : (
                     <div className='text-sm text-gray-500 text-center py-2'>
                       No rooms available
+                    </div>
+                  )}
+                  
+                  {/* Password Input Modal */}
+                  {selectedRoomToJoin && (
+                    <div className='fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50'>
+                      <div className='bg-white p-4 rounded-lg shadow-lg max-w-sm w-full mx-4'>
+                        <h3 className='text-lg font-medium text-gray-900 mb-4'>Enter Room Password</h3>
+                        <p className='text-sm text-gray-600 mb-4'>
+                          This room is password protected. Please enter the 6-digit password.
+                        </p>
+                        <input
+                          type='text'
+                          placeholder='Enter 6-digit password'
+                          value={joinRoomPassword}
+                          onChange={(e) => setJoinRoomPassword(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                          className='w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500'
+                          maxLength={6}
+                          autoFocus
+                        />
+                        <div className='flex gap-2 mt-4'>
+                          <button
+                            type='button'
+                            className='flex-1 px-3 py-2 bg-blue-500 text-white rounded-md hover:bg-blue-600'
+                            onClick={handleJoinRoomWithPassword}
+                            disabled={joinRoomPassword.length !== 6}
+                          >
+                            Join Room
+                          </button>
+                          <button
+                            type='button'
+                            className='flex-1 px-3 py-2 bg-gray-300 text-gray-700 rounded-md hover:bg-gray-400'
+                            onClick={() => {
+                              setSelectedRoomToJoin(null)
+                              setJoinRoomPassword('')
+                            }}
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
                     </div>
                   )}
                 </div>
@@ -553,18 +815,23 @@ const page: FC<pageProps> = ({}) => {
         {/* Drawing Tools */}
         <div className='p-3 rounded-md bg-gray-50 border border-gray-200'>
           <div className='text-sm font-medium text-gray-700 mb-2'>Drawing Tools</div>
-          <div className='flex gap-2 mb-3'>
+          <div className='flex flex-wrap gap-2 mb-3'>
             {(['brush', 'rectangle', 'circle', 'line', 'eraser'] as DrawingTool[]).map((tool) => (
               <button
                 key={tool}
                 type='button'
-                className={`p-2 rounded-md border text-sm font-medium ${
+                className={`px-2 py-2 rounded-md border text-sm font-medium transition-colors flex-shrink-0 ${
                   selectedTool === tool
-                    ? 'bg-blue-500 text-white border-blue-500'
+                    ? 'bg-blue-500 text-white border-blue-500 shadow-md'
                     : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
                 }`}
                 onClick={() => setSelectedTool(tool)}
               >
+                {tool === 'brush' && '🖌️ '}
+                {tool === 'rectangle' && '⬜ '}
+                {tool === 'circle' && '⭕ '}
+                {tool === 'line' && '📏 '}
+                {tool === 'eraser' && '🧽 '}
                 {tool.charAt(0).toUpperCase() + tool.slice(1)}
               </button>
             ))}
@@ -587,12 +854,17 @@ const page: FC<pageProps> = ({}) => {
         </div>
 
         {/* Color Picker */}
-        {isClient && (
-          <div className='p-3 rounded-md bg-gray-50 border border-gray-200'>
-            <div className='text-sm font-medium text-gray-700 mb-2'>Color</div>
-            <ChromePicker color={color} onChange={(e) => setColor(e.hex)} />
+        <div className='p-3 rounded-md bg-gray-50 border border-gray-200'>
+          <div className='text-sm font-medium text-gray-700 mb-2'>Color</div>
+          <div className='flex justify-center'>
+            <ChromePicker 
+              color={color} 
+              onChange={(e) => setColor(e.hex)}
+              width="225px"
+              disableAlpha={true}
+            />
           </div>
-        )}
+        </div>
 
         {/* Drawing Persistence */}
         {currentRoom && (
@@ -724,24 +996,24 @@ const page: FC<pageProps> = ({}) => {
             <button
               type='button'
               className={`p-2 rounded-md border text-sm font-medium ${
-                canUndo()
+                canUndoState
                   ? 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
                   : 'bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed'
               }`}
               onClick={handleUndo}
-              disabled={!canUndo()}
+              disabled={!canUndoState}
             >
               ↶ Undo
             </button>
             <button
               type='button'
               className={`p-2 rounded-md border text-sm font-medium ${
-                canRedo()
+                canRedoState
                   ? 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
                   : 'bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed'
               }`}
               onClick={handleRedo}
-              disabled={!canRedo()}
+              disabled={!canRedoState}
             >
               ↷ Redo
             </button>
@@ -754,18 +1026,431 @@ const page: FC<pageProps> = ({}) => {
             🗑️ Clear Canvas
           </button>
         </div>
+        </div>
+
+        {/* Main Canvas Area */}
+        <div className='flex-1 flex flex-col items-center justify-center p-4 lg:p-8'>
+          {/* Mobile Controls - Shown only on mobile */}
+          <div className='lg:hidden w-full mb-4 space-y-2'>
+            {/* Mobile Tool Selection */}
+            <div className='flex flex-wrap gap-1 pb-2'>
+              {(['brush', 'rectangle', 'circle', 'line', 'eraser'] as DrawingTool[]).map((tool) => (
+                <button
+                  key={tool}
+                  type='button'
+                  className={`px-2 py-2 rounded-md border text-xs font-medium transition-colors flex-shrink-0 ${
+                    selectedTool === tool
+                      ? 'bg-blue-500 text-white border-blue-500 shadow-md'
+                      : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
+                  }`}
+                  onClick={() => setSelectedTool(tool)}
+                >
+                  {tool === 'brush' && '🖌️ '}
+                  {tool === 'rectangle' && '⬜ '}
+                  {tool === 'circle' && '⭕ '}
+                  {tool === 'line' && '📏 '}
+                  {tool === 'eraser' && '🧽 '}
+                  <span className='hidden sm:inline'>{tool.charAt(0).toUpperCase() + tool.slice(1)}</span>
+                </button>
+              ))}
+            </div>
+
+            {/* Mobile Action Buttons */}
+            <div className='flex flex-wrap gap-2'>
+              <button
+                type='button'
+                className={`px-2 py-2 rounded-md border text-xs font-medium flex-shrink-0 ${
+                  canUndoState
+                    ? 'bg-white text-gray-700 border-gray-300'
+                    : 'bg-gray-100 text-gray-400 border-gray-200'
+                }`}
+                onClick={handleUndo}
+                disabled={!canUndoState}
+              >
+                ↶ <span className='hidden xs:inline'>Undo</span>
+              </button>
+              <button
+                type='button'
+                className={`px-2 py-2 rounded-md border text-xs font-medium flex-shrink-0 ${
+                  canRedoState
+                    ? 'bg-white text-gray-700 border-gray-300'
+                    : 'bg-gray-100 text-gray-400 border-gray-200'
+                }`}
+                onClick={handleRedo}
+                disabled={!canRedoState}
+              >
+                ↷ <span className='hidden xs:inline'>Redo</span>
+              </button>
+              <button
+                type='button'
+                className='px-2 py-2 rounded-md border border-red-300 text-red-700 bg-white text-xs font-medium flex-shrink-0'
+                onClick={handleClear}
+              >
+                🗑️ <span className='hidden xs:inline'>Clear</span>
+              </button>
+            </div>
+
+            {/* Mobile Brush Size */}
+            <div className='flex items-center gap-2'>
+              <label className='text-sm font-medium text-gray-700'>
+                Size: {brushSize}px
+              </label>
+              <input
+                type='range'
+                min='1'
+                max='20'
+                value={brushSize}
+                onChange={(e) => setBrushSize(Number(e.target.value))}
+                className='flex-1 h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer'
+              />
+            </div>
+          </div>
+
+          {/* Responsive Canvas Container */}
+          <div className='relative w-full max-w-2xl aspect-square'>
+            <canvas
+              ref={canvasRef}
+              onMouseDown={handleMouseDown}
+              onMouseMove={handleMouseMove}
+              onMouseUp={handleMouseUp}
+              onMouseLeave={handleMouseUp}
+              onTouchStart={(e) => {
+                e.preventDefault()
+                const touch = e.touches[0]
+                const rect = canvasRef.current?.getBoundingClientRect()
+                if (rect) {
+                  const point = {
+                    x: touch.clientX - rect.left,
+                    y: touch.clientY - rect.top
+                  }
+                  handleMouseDown({ clientX: touch.clientX, clientY: touch.clientY } as any)
+                }
+              }}
+              onTouchEnd={(e) => {
+                e.preventDefault()
+                handleMouseUp()
+              }}
+              onTouchMove={(e) => {
+                e.preventDefault()
+                const touch = e.touches[0]
+                const rect = canvasRef.current?.getBoundingClientRect()
+                if (rect && isDrawing) {
+                  const point = {
+                    x: touch.clientX - rect.left,
+                    y: touch.clientY - rect.top
+                  }
+                  
+                  // Handle touch drawing based on tool
+                  if (selectedTool === 'brush' || selectedTool === 'eraser') {
+                    if (canvasRef.current) {
+                      const ctx = canvasRef.current.getContext('2d')
+                      if (ctx && startPoint) {
+                        drawLine({ prevPoint: startPoint, currentPoint: point, ctx })
+                        setStartPoint(point)
+                      }
+                    }
+                  } else if (selectedTool === 'rectangle' || selectedTool === 'circle' || selectedTool === 'line') {
+                    // Update current path for shape preview
+                    setCurrentPath([startPoint!, point])
+                    
+                    // Redraw the canvas with the preview
+                    if (canvasRef.current) {
+                      const ctx = canvasRef.current.getContext('2d')
+                      if (ctx) {
+                        // Clear and redraw everything
+                        redrawCanvas(ctx, getCurrentHistory())
+                        
+                        // Draw the preview shape
+                        drawShape(ctx, selectedTool, [startPoint!, point], color, brushSize)
+                      }
+                    }
+                  }
+                }
+              }}
+              width={600}
+              height={600}
+              className='w-full h-full border border-gray-300 rounded-md cursor-crosshair touch-none'
+              style={{ 
+                cursor: selectedTool === 'eraser' ? 'grab' : 'crosshair',
+                maxWidth: '100%',
+                maxHeight: '100%'
+              }}
+            />
+          </div>
+
+          {/* Mobile Color Picker */}
+          <div className='lg:hidden mt-4 w-full'>
+            <div className='text-sm font-medium text-gray-700 mb-2 text-center'>Color</div>
+            <div className='flex justify-center overflow-x-auto'>
+              <ChromePicker 
+                color={color} 
+                onChange={(e) => setColor(e.hex)}
+                width="280px"
+                disableAlpha={true}
+              />
+            </div>
+          </div>
+        </div>
+
+        {/* Mobile Bottom Sheet for Additional Controls */}
+        <div className='lg:hidden fixed bottom-0 left-0 right-0 bg-white border-t shadow-lg max-h-96 overflow-y-auto'>
+          <div className='p-4 space-y-4'>
+            {/* Room Management for Mobile */}
+            <div className='p-3 rounded-md bg-purple-50 border border-purple-200'>
+              <div className='text-sm font-medium text-purple-800 mb-2'>Room Management</div>
+              
+              {currentRoom ? (
+                <div className='space-y-2'>
+                  <div className='flex items-center justify-between'>
+                    <span className='text-sm text-purple-700'>
+                      Room: <strong>{currentRoom.name}</strong>
+                    </span>
+                    <button
+                      type='button'
+                      className='px-2 py-1 text-xs bg-red-100 text-red-700 rounded'
+                      onClick={handleLeaveRoom}
+                    >
+                      Leave
+                    </button>
+                  </div>
+                  <div className='text-xs text-purple-600'>
+                    Users: {connectedUsers.length} | by {currentRoom.createdBy}
+                  </div>
+                </div>
+              ) : (
+                <div className='space-y-2'>
+                  <div className='flex gap-2'>
+                    <button
+                      type='button'
+                      className='px-3 py-1 text-sm bg-purple-100 text-purple-700 rounded'
+                      onClick={toggleCreateRoom}
+                    >
+                      Create Room
+                    </button>
+                    <button
+                      type='button'
+                      className='px-3 py-1 text-sm bg-purple-100 text-purple-700 rounded'
+                      onClick={() => {
+                        toggleRoomList()
+                        handleGetRooms()
+                      }}
+                    >
+                      Join Room
+                    </button>
+                  </div>
+                  
+                  {isCreatingRoom && (
+                    <div className='space-y-2'>
+                      <input
+                        type='text'
+                        placeholder='Room name'
+                        value={newRoomName}
+                        onChange={(e) => setNewRoomName(e.target.value)}
+                        className='w-full px-2 py-1 text-sm border border-purple-300 rounded'
+                        onKeyPress={(e) => e.key === 'Enter' && handleCreateRoom()}
+                      />
+                      <input
+                        type='text'
+                        placeholder='Password (6 digits, optional)'
+                        value={newRoomPassword}
+                        onChange={(e) => setNewRoomPassword(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                        className='w-full px-2 py-1 text-sm border border-purple-300 rounded'
+                        maxLength={6}
+                      />
+                      <div className='flex gap-2'>
+                        <button
+                          type='button'
+                          className='px-2 py-1 text-sm bg-green-100 text-green-700 rounded'
+                          onClick={handleCreateRoom}
+                        >
+                          Create
+                        </button>
+                        <button
+                          type='button'
+                          className='px-2 py-1 text-sm bg-gray-100 text-gray-700 rounded'
+                          onClick={toggleCreateRoom}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                  
+                  {showRoomList && (
+                    <div className='max-h-32 overflow-y-auto space-y-1'>
+                      {availableRooms.length > 0 ? (
+                        availableRooms.map((room) => (
+                          <div key={room.id} className='flex items-center justify-between p-2 bg-white rounded border'>
+                            <div className='text-sm'>
+                              <div className='font-medium flex items-center gap-1'>
+                                {room.name}
+                                {room.password && <span className='text-xs text-orange-600'>🔒</span>}
+                              </div>
+                              <div className='text-xs text-gray-500'>
+                                {room.userCount} users | by {room.createdBy}
+                              </div>
+                            </div>
+                            <button
+                              type='button'
+                              className='px-2 py-1 text-xs bg-blue-100 text-blue-700 rounded'
+                              onClick={() => handleJoinRoom(room.id)}
+                            >
+                              Join
+                            </button>
+                          </div>
+                        ))
+                      ) : (
+                        <div className='text-sm text-gray-500 text-center py-2'>
+                          No rooms available
+                        </div>
+                      )}
+                      
+                      {/* Password Input Modal for Mobile */}
+                      {selectedRoomToJoin && (
+                        <div className='fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4'>
+                          <div className='bg-white p-4 rounded-lg shadow-lg max-w-sm w-full'>
+                            <h3 className='text-lg font-medium text-gray-900 mb-4'>Enter Room Password</h3>
+                            <p className='text-sm text-gray-600 mb-4'>
+                              This room is password protected. Please enter the 6-digit password.
+                            </p>
+                            <input
+                              type='text'
+                              placeholder='Enter 6-digit password'
+                              value={joinRoomPassword}
+                              onChange={(e) => setJoinRoomPassword(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                              className='w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500'
+                              maxLength={6}
+                              autoFocus
+                            />
+                            <div className='flex gap-2 mt-4'>
+                              <button
+                                type='button'
+                                className='flex-1 px-3 py-2 bg-blue-500 text-white rounded-md hover:bg-blue-600'
+                                onClick={handleJoinRoomWithPassword}
+                                disabled={joinRoomPassword.length !== 6}
+                              >
+                                Join Room
+                              </button>
+                              <button
+                                type='button'
+                                className='flex-1 px-3 py-2 bg-gray-300 text-gray-700 rounded-md hover:bg-gray-400'
+                                onClick={() => {
+                                  setSelectedRoomToJoin(null)
+                                  setJoinRoomPassword('')
+                                }}
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Drawing Persistence for Mobile */}
+            {currentRoom && (
+              <div className='p-3 rounded-md bg-green-50 border border-green-200'>
+                <div className='text-sm font-medium text-green-800 mb-2'>Save & Load</div>
+                <div className='space-y-2'>
+                  <div className='flex gap-2'>
+                    <button
+                      type='button'
+                      className='px-3 py-1 text-sm bg-green-100 text-green-700 rounded'
+                      onClick={toggleSaveDialog}
+                      disabled={isSaving}
+                    >
+                      {isSaving ? 'Saving...' : 'Save'}
+                    </button>
+                    <button
+                      type='button'
+                      className='px-3 py-1 text-sm bg-blue-100 text-blue-700 rounded'
+                      onClick={() => {
+                        toggleLoadDialog()
+                        handleGetDrawings()
+                      }}
+                    >
+                      Load
+                    </button>
+                  </div>
+                  
+                  {showSaveDialog && (
+                    <div className='flex gap-2'>
+                      <input
+                        type='text'
+                        placeholder='Drawing name'
+                        value={saveDrawingName}
+                        onChange={(e) => setSaveDrawingName(e.target.value)}
+                        className='flex-1 px-2 py-1 text-sm border border-green-300 rounded'
+                        onKeyPress={(e) => e.key === 'Enter' && handleSaveDrawing()}
+                      />
+                      <button
+                        type='button'
+                        className='px-2 py-1 text-sm bg-green-100 text-green-700 rounded'
+                        onClick={handleSaveDrawing}
+                        disabled={!saveDrawingName.trim() || isSaving}
+                      >
+                        Save
+                      </button>
+                      <button
+                        type='button'
+                        className='px-2 py-1 text-sm bg-gray-100 text-gray-700 rounded'
+                        onClick={toggleSaveDialog}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  )}
+                  
+                  {showLoadDialog && (
+                    <div className='max-h-32 overflow-y-auto space-y-1'>
+                      {getDrawingsForRoom(currentRoom.id).length > 0 ? (
+                        getDrawingsForRoom(currentRoom.id).map((drawing) => (
+                          <div key={drawing.id} className='flex items-center justify-between p-2 bg-white rounded border'>
+                            <div className='text-sm'>
+                              <div className='font-medium'>{drawing.name}</div>
+                              <div className='text-xs text-gray-500'>
+                                by {drawing.createdBy}
+                              </div>
+                            </div>
+                            <div className='flex gap-1'>
+                              <button
+                                type='button'
+                                className='px-2 py-1 text-xs bg-blue-100 text-blue-700 rounded'
+                                onClick={() => handleLoadDrawing(drawing.id)}
+                                disabled={isLoading}
+                              >
+                                Load
+                              </button>
+                              {drawing.createdBy === currentUser?.name && (
+                                <button
+                                  type='button'
+                                  className='px-2 py-1 text-xs bg-red-100 text-red-700 rounded'
+                                  onClick={() => deleteDrawing(drawing.id, socket)}
+                                >
+                                  Delete
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        ))
+                      ) : (
+                        <div className='text-sm text-gray-500 text-center py-2'>
+                          No saved drawings
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
       </div>
-      <canvas
-        ref={canvasRef}
-        onMouseDown={handleMouseDown}
-        onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseUp}
-        width={600}
-        height={600}
-        className='border border-black rounded-md cursor-crosshair'
-        style={{ cursor: selectedTool === 'eraser' ? 'grab' : 'crosshair' }}
-      />
-    </div>
+    </ClientOnlyWrapper>
   )
 }
 

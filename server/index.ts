@@ -38,6 +38,7 @@ type Room = {
     createdAt: number
     userCount: number
     isPrivate: boolean
+    password?: string
 }
 
 type SavedDrawing = {
@@ -87,9 +88,15 @@ io.on('connection', (socket) => {
     });
 
     // Room management events
-    socket.on('create-room', ({ roomName, isPrivate }: { roomName: string, isPrivate: boolean }) => {
+    socket.on('create-room', ({ roomName, isPrivate, password }: { roomName: string, isPrivate: boolean, password?: string }) => {
         const user = connectedUsers.get(socket.id);
         if (!user) return;
+
+        // Validate password if provided
+        if (password && (password.length !== 6 || !/^\d{6}$/.test(password))) {
+            socket.emit('room-creation-error', { message: 'Password must be exactly 6 digits' });
+            return;
+        }
 
         const room: Room = {
             id: `room_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
@@ -97,7 +104,8 @@ io.on('connection', (socket) => {
             createdBy: user.name,
             createdAt: Date.now(),
             userCount: 1,
-            isPrivate
+            isPrivate,
+            password: password || undefined
         };
 
         rooms.set(room.id, room);
@@ -114,14 +122,23 @@ io.on('connection', (socket) => {
         const publicRooms = Array.from(rooms.values()).filter(r => !r.isPrivate);
         io.emit('rooms-list', { rooms: publicRooms });
 
-        console.log(`🏠 Room created: ${room.name} by ${user.name}`);
+        console.log(`🏠 Room created: ${room.name} by ${user.name}${password ? ' (password protected)' : ''}`);
     });
 
-    socket.on('join-room', ({ roomId }: { roomId: string }) => {
+    socket.on('join-room', ({ roomId, password }: { roomId: string, password?: string }) => {
         const user = connectedUsers.get(socket.id);
         const room = rooms.get(roomId);
         
-        if (!user || !room) return;
+        if (!user || !room) {
+            socket.emit('room-join-error', { message: 'Room not found' });
+            return;
+        }
+
+        // Check password if room is password protected
+        if (room.password && room.password !== password) {
+            socket.emit('room-join-error', { message: 'Incorrect password' });
+            return;
+        }
 
         // Leave current room if any
         const currentRoomId = userRooms.get(socket.id);
@@ -278,6 +295,17 @@ io.on('connection', (socket) => {
     socket.on('clear-canvas', ({ roomId }: { roomId: string }) => {
         // Only broadcast to users in the same room
         socket.to(roomId).emit('clear-canvas', { roomId })
+    })
+
+    // Undo/Redo events
+    socket.on('undo-action', ({ roomId }: { roomId: string }) => {
+        // Broadcast undo action to all users in the same room
+        socket.to(roomId).emit('undo-action', { roomId })
+    })
+
+    socket.on('redo-action', ({ roomId }: { roomId: string }) => {
+        // Broadcast redo action to all users in the same room
+        socket.to(roomId).emit('redo-action', { roomId })
     })
 
     socket.on('disconnect', () => {

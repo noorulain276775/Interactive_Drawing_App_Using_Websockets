@@ -116,6 +116,40 @@ export const useSocket = () => {
       }
     })
 
+    // Password-related error handlers
+    socketRef.current.on('room-creation-error', ({ message }: { message: string }) => {
+      console.error('❌ Room creation error:', message)
+      // Update error message in the room hook
+      if (window.updateErrorMessage) {
+        window.updateErrorMessage(message)
+      }
+    })
+
+    socketRef.current.on('room-join-error', ({ message }: { message: string }) => {
+      console.error('❌ Room join error:', message)
+      // Update error message in the room hook
+      if (window.updateErrorMessage) {
+        window.updateErrorMessage(message)
+      }
+    })
+
+    // Undo/Redo events from other users
+    socketRef.current.on('undo-action', ({ roomId }: { roomId: string }) => {
+      console.log('↶ Undo action received from other user')
+      // Handle undo action from other users
+      if (window.handleUndoFromOther) {
+        window.handleUndoFromOther()
+      }
+    })
+
+    socketRef.current.on('redo-action', ({ roomId }: { roomId: string }) => {
+      console.log('↷ Redo action received from other user')
+      // Handle redo action from other users
+      if (window.handleRedoFromOther) {
+        window.handleRedoFromOther()
+      }
+    })
+
     // Drawing persistence events
     socketRef.current.on('drawing-saved', ({ drawing }: { drawing: SavedDrawing }) => {
       console.log('💾 Drawing saved:', drawing.name)

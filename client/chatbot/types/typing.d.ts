@@ -60,6 +60,7 @@ type Room = {
     createdAt: number
     userCount: number
     isPrivate: boolean
+    password?: string
 }
 
 type RoomJoined = {
