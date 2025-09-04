@@ -1,0 +1,9 @@
+server/node_modules
+client/chatbot/node_modules
+client/chatbot/.next
+client/chatbot/out
+client/chatbot/build
+client/chatbot/dist
+client/chatbot/coverage
+client/chatbot/dist
+client/chatbot/dist
